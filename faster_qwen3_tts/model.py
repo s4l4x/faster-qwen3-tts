@@ -17,6 +17,71 @@ from .utils import suppress_flash_attn_warning
 logger = logging.getLogger(__name__)
 
 
+def _audio_to_numpy(audio) -> np.ndarray:
+    if hasattr(audio, 'cpu'):
+        return audio.flatten().cpu().numpy()
+    return audio.flatten() if hasattr(audio, 'flatten') else audio
+
+
+class _SlotStreamDecoder:
+    """Per-slot codec→wav decode state for batched streaming.
+
+    Mirrors the hybrid strategy inlined in generate_voice_clone_streaming:
+    accumulated decode until samples_per_frame is calibrated, then a sliding
+    window with left context (avoids boundary pops at constant cost). Keep the
+    two in sync.
+    """
+
+    def __init__(self, speech_tokenizer, ref_codes, chunk_size: int, context_frames: int = 25):
+        self.speech_tokenizer = speech_tokenizer
+        self.ref_codes = ref_codes
+        self.context_frames = context_frames
+        self.min_calibration_frames = max(context_frames, chunk_size)
+        self.all_codes = []
+        self.prev_gen_audio_len = 0
+        self.samples_per_frame = None
+
+    def feed(self, new_codes: torch.Tensor) -> Tuple[np.ndarray, int]:
+        """Feed [n, 16] new codec frames; return (new_audio, sample_rate)."""
+        self.all_codes.append(new_codes)
+        n_new = new_codes.shape[0]
+        all_flat = torch.cat(self.all_codes, dim=0)
+        n_total = all_flat.shape[0]
+
+        if self.samples_per_frame is None:
+            # Accumulated decode; in ICL mode prepend reference codes for
+            # acoustic context, then cut the reference portion back off.
+            if self.ref_codes is not None:
+                codes_input = torch.cat([self.ref_codes.to(all_flat.device), all_flat], dim=0)
+            else:
+                codes_input = all_flat
+            audio_list, sr = self.speech_tokenizer.decode(
+                {"audio_codes": codes_input.unsqueeze(0)}
+            )
+            audio = _audio_to_numpy(audio_list[0])
+            if self.ref_codes is not None:
+                ref_len = self.ref_codes.shape[0]
+                total_len = codes_input.shape[0]
+                gen_audio = audio[int(ref_len / max(total_len, 1) * len(audio)):]
+            else:
+                gen_audio = audio
+            new_audio = gen_audio[self.prev_gen_audio_len:]
+            self.prev_gen_audio_len = len(gen_audio)
+            if n_total >= self.min_calibration_frames:
+                self.samples_per_frame = len(gen_audio) / n_total
+        else:
+            ctx_start = max(0, n_total - n_new - self.context_frames)
+            window = all_flat[ctx_start:]
+            n_ctx = window.shape[0] - n_new
+            audio_list, sr = self.speech_tokenizer.decode(
+                {"audio_codes": window.unsqueeze(0)}
+            )
+            audio = _audio_to_numpy(audio_list[0])
+            if n_ctx > 0:
+                new_audio = audio[int(round(n_ctx * self.samples_per_frame)):]
+            else:
+                new_audio = audio
+        return new_audio, sr
 
 
 class FasterQwen3TTS:
@@ -239,12 +304,52 @@ class FasterQwen3TTS:
         """Warm up and capture CUDA graphs with given prefill length."""
         if self._warmed_up:
             return
-            
+
         logger.info("Warming up CUDA graphs...")
         self.predictor_graph.capture(num_warmup=3)
         self.talker_graph.capture(prefill_len=prefill_len, num_warmup=3)
         self._warmed_up = True
         logger.info("CUDA graphs captured and ready")
+
+    def enable_batch(self, batch_size: int, max_seq_len: Optional[int] = None):
+        """Build and capture a second pair of CUDA graphs at a fixed batch size.
+
+        The bs=1 graphs stay untouched, so the serial API keeps working. Call
+        once before generate_voice_clone_streaming_batch; ~30 s of capture time
+        and one extra StaticCache worth of VRAM per batch slot.
+        """
+        from .predictor_graph import PredictorGraph
+        from .talker_graph import TalkerGraph
+
+        if getattr(self, "_batch_size", None) == batch_size:
+            return
+        m = self.model.model
+        talker = m.talker
+        talker_config = m.config.talker_config
+        logger.info(f"Building batched CUDA graphs (bs={batch_size})...")
+        self.predictor_graph_batch = PredictorGraph(
+            talker.code_predictor,
+            talker.code_predictor.model.config,
+            talker_config.hidden_size,
+            device=self.device,
+            dtype=self.dtype,
+            do_sample=True,
+            top_k=50,
+            temperature=0.9,
+            batch_size=batch_size,
+        )
+        self.talker_graph_batch = TalkerGraph(
+            talker.model,
+            talker_config,
+            device=self.device,
+            dtype=self.dtype,
+            max_seq_len=max_seq_len or self.max_seq_len,
+            batch_size=batch_size,
+        )
+        self.predictor_graph_batch.capture(num_warmup=3)
+        self.talker_graph_batch.capture(num_warmup=3)
+        self._batch_size = batch_size
+        logger.info(f"Batched CUDA graphs ready (bs={batch_size})")
     
     def generate(
         self,
@@ -1126,6 +1231,124 @@ class FasterQwen3TTS:
                     new_audio = audio
 
             yield new_audio, sr, timing
+
+    def _prepare_generation_batch(self, requests: List[Dict[str, Any]], non_streaming_mode: bool):
+        """Batched analogue of _prepare_generation: resolve each request's voice
+        prompt independently, merge into the dict-of-lists shape
+        _build_talker_inputs_local consumes, and build left-padded batch inputs.
+
+        Returns (m, talker, config, tie, tam, tth, tpe, slot_ref_codes).
+        """
+        non_streaming_mode = self._resolve_non_streaming_mode(
+            non_streaming_mode,
+            default=False,
+        )
+
+        input_texts = [self.model._build_assistant_text(r["text"]) for r in requests]
+        input_ids = self.model._tokenize_texts(input_texts)
+
+        vcp = {"ref_code": [], "ref_spk_embedding": [], "x_vector_only_mode": [], "icl_mode": []}
+        ref_ids = []
+        slot_ref_codes = []
+        for i, r in enumerate(requests):
+            vcp_i, ref_ids_i, _ = self._resolve_voice_clone_prompt(
+                input_ids=[input_ids[i]],
+                ref_audio=r.get("ref_audio"),
+                ref_text=r.get("ref_text", ""),
+                xvec_only=r.get("xvec_only", False),
+                append_silence=r.get("append_silence", True),
+                voice_clone_prompt=r.get("voice_clone_prompt"),
+            )
+            for key in vcp:
+                vcp[key].append(vcp_i[key][0])
+            ref_ids.append(ref_ids_i[0])
+            slot_ref_codes.append(vcp_i["ref_code"][0] if vcp_i["icl_mode"][0] else None)
+
+        m = self.model.model
+        tie, tam, tth, tpe = self._build_talker_inputs_local(
+            m=m,
+            input_ids=input_ids,
+            ref_ids=ref_ids,
+            voice_clone_prompt=vcp,
+            languages=[r.get("language") or "Auto" for r in requests],
+            speakers=None,
+            non_streaming_mode=non_streaming_mode,
+            instruct_ids=None,
+        )
+
+        talker = m.talker
+        config = m.config.talker_config
+        talker.rope_deltas = None
+
+        return m, talker, config, tie, tam, tth, tpe, slot_ref_codes
+
+    @torch.inference_mode()
+    def generate_voice_clone_streaming_batch(
+        self,
+        requests: List[Dict[str, Any]],
+        max_new_tokens: int = 2048,
+        min_new_tokens: int = 2,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        do_sample: bool = True,
+        repetition_penalty: float = 1.05,
+        chunk_size: int = 12,
+        non_streaming_mode: Optional[bool] = None,
+    ) -> Generator[Tuple[int, np.ndarray, int, dict], None, None]:
+        """Batched voice-clone streaming: N requests decode in lockstep on the
+        bs=N CUDA graphs. Call enable_batch(N) once first.
+
+        Each request dict takes the serial API's arguments: text (required),
+        language, ref_audio, ref_text, xvec_only, append_silence,
+        voice_clone_prompt.
+
+        Yields (slot_index, audio_chunk, sample_rate, timing); a slot stops
+        yielding once it hits EOS while the rest of the batch continues.
+        """
+        from .streaming import fast_generate_streaming_batch
+
+        bs = len(requests)
+        if getattr(self, "_batch_size", None) != bs:
+            raise RuntimeError(
+                f"batched graphs not ready for bs={bs}; call enable_batch({bs}) first"
+            )
+
+        m, talker, config, tie, tam, tth, tpe, slot_ref_codes = self._prepare_generation_batch(
+            requests, non_streaming_mode=non_streaming_mode
+        )
+
+        speech_tokenizer = m.speech_tokenizer
+        decoders = [
+            _SlotStreamDecoder(speech_tokenizer, slot_ref_codes[b], chunk_size)
+            for b in range(bs)
+        ]
+
+        for codec_chunk, valid, timing in fast_generate_streaming_batch(
+            talker=talker,
+            talker_input_embeds=tie,
+            attention_mask=tam,
+            trailing_text_hiddens=tth,
+            tts_pad_embed=tpe,
+            config=config,
+            predictor_graph=self.predictor_graph_batch,
+            talker_graph=self.talker_graph_batch,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+            chunk_size=chunk_size,
+        ):
+            for b in range(bs):
+                slot_codes = codec_chunk[b][valid[b]]  # [n_valid, 16]
+                if slot_codes.shape[0] == 0:
+                    continue
+                new_audio, sr = decoders[b].feed(slot_codes)
+                if new_audio is not None and len(new_audio) > 0:
+                    yield b, new_audio, sr, timing
 
     @torch.inference_mode()
     def generate_custom_voice(

@@ -189,6 +189,209 @@ def fast_generate_streaming(
 
 
 @torch.inference_mode()
+def fast_generate_streaming_batch(
+    talker,
+    talker_input_embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    trailing_text_hiddens: torch.Tensor,
+    tts_pad_embed: torch.Tensor,
+    config,
+    predictor_graph: PredictorGraph,
+    talker_graph: TalkerGraph,
+    max_new_tokens: int = 2048,
+    min_new_tokens: int = 2,
+    temperature: float = 0.9,
+    top_k: int = 50,
+    top_p: float = 1.0,
+    do_sample: bool = True,
+    repetition_penalty: float = 1.05,
+    chunk_size: int = 12,
+) -> Generator[Tuple[torch.Tensor, torch.Tensor, dict], None, None]:
+    """
+    Batched twin of fast_generate_streaming (see NOTE there about keeping the
+    decode loops in sync).
+
+    talker_input_embeds: [bs, L, H] LEFT-padded; attention_mask: [bs, L].
+    Left padding aligns every slot to the same decode position, so one shared
+    cache_position drives the whole batch; the padding mask handles length skew.
+
+    Slots that hit EOS keep stepping with their lane parked on eos_id (batch
+    attention is per-slot independent, so their garbage never leaks); the valid
+    mask excludes them from output.
+
+    Yields (codec_chunk [bs, n, 16], valid [bs, n] bool, timing) every
+    chunk_size steps. The final chunk may be shorter.
+    """
+    bs = talker_input_embeds.shape[0]
+    if bs != predictor_graph.batch_size or bs != talker_graph.batch_size:
+        raise ValueError(
+            f"batch size {bs} != graphs (predictor {predictor_graph.batch_size}, "
+            f"talker {talker_graph.batch_size}); recapture the graphs at bs={bs}"
+        )
+    eos_id = config.codec_eos_token_id
+    vocab_size = config.vocab_size
+    device = talker_input_embeds.device
+
+    suppress_mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+    suppress_start = max(0, vocab_size - 1024)
+    for i in range(suppress_start, vocab_size):
+        if i != eos_id:
+            suppress_mask[i] = True
+
+    predictor = talker.code_predictor
+    talker_codec_embed = talker.get_input_embeddings()
+    talker_codec_head = talker.codec_head
+    predictor_codec_embeds = predictor.get_input_embeddings()
+    num_code_groups = config.num_code_groups
+
+    # === PREFILL (HF forward is already batch-aware) ===
+    t_start = time.time()
+
+    out = talker.forward(
+        inputs_embeds=talker_input_embeds,
+        attention_mask=attention_mask,
+        use_cache=True,
+        output_hidden_states=True,
+        return_dict=True,
+        trailing_text_hidden=trailing_text_hiddens,
+        tts_pad_embed=tts_pad_embed,
+        generation_step=None,
+        past_hidden=None,
+        past_key_values=None,
+    )
+
+    talker_past_kv = out.past_key_values
+    past_hidden = out.past_hidden  # [bs, 1, H]
+    gen_step = out.generation_step
+
+    logits = out.logits[:, -1, :]  # [bs, vocab]
+    suppress_eos = min_new_tokens > 0
+    token = sample_logits(
+        logits,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        do_sample=do_sample,
+        suppress_mask=suppress_mask,
+        suppress_tokens=[eos_id] if suppress_eos else None,
+    )  # [bs]
+
+    prefill_len = talker_graph.prefill_kv(talker_past_kv)
+    rope_deltas = getattr(talker, "rope_deltas", None)
+    talker_graph.set_generation_state(attention_mask, rope_deltas)
+
+    torch.cuda.synchronize()
+    t_prefill = time.time() - t_start
+
+    # === DECODE LOOP ===
+    done = torch.zeros(bs, dtype=torch.bool, device=device)
+    eos_fill = torch.full((bs,), eos_id, dtype=token.dtype, device=device)
+    histories: list[list[torch.Tensor]] = [[] for _ in range(bs)]
+    chunk_buffer = []
+    valid_buffer = []
+    total_steps = 0
+    chunk_count = 0
+    chunk_start = time.time()
+
+    for step_idx in range(max_new_tokens):
+        done = done | (token == eos_id)
+        if bool(done.all()):
+            break
+        # Park finished lanes on eos so their compute is inert.
+        token = torch.where(done, eos_fill, token)
+
+        # --- CUDA-Graphed Code Predictor ---
+        last_id_hidden = talker_codec_embed(token.unsqueeze(1))  # [bs, 1, H]
+        pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)
+        codebook_token_ids = predictor_graph.run(pred_input)  # [bs, 15]
+
+        all_cb = torch.cat([token.unsqueeze(1), codebook_token_ids], dim=1)  # [bs, 16]
+        chunk_buffer.append(all_cb.detach())
+        valid_buffer.append(~done)
+        for b in range(bs):
+            if not done[b]:
+                histories[b].append(token[b].detach())
+
+        # --- Build input embedding for talker ---
+        codec_hiddens = [last_id_hidden]
+        for i in range(num_code_groups - 1):
+            codec_hiddens.append(
+                predictor_codec_embeds[i](codebook_token_ids[:, i].unsqueeze(1))
+            )
+        inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)  # [bs, 1, H]
+
+        if gen_step < trailing_text_hiddens.shape[1]:
+            inputs_embeds = inputs_embeds + trailing_text_hiddens[:, gen_step].unsqueeze(1)
+        else:
+            inputs_embeds = inputs_embeds + tts_pad_embed  # broadcasts over bs
+
+        # --- CUDA-Graphed Talker decode step (shared position: left padding) ---
+        current_pos = prefill_len + step_idx
+        if current_pos >= talker_graph.max_seq_len - 1:
+            break
+
+        hidden_states = talker_graph.run(inputs_embeds, position=current_pos)
+
+        logits = talker_codec_head(hidden_states[:, -1, :])  # [bs, vocab]
+
+        if repetition_penalty != 1.0:
+            # ponytail: per-slot python loop (bs<=8); vectorize if profiling says so
+            for b in range(bs):
+                if histories[b]:
+                    apply_repetition_penalty(
+                        logits[b : b + 1], torch.stack(histories[b]), repetition_penalty
+                    )
+
+        suppress_eos = (step_idx + 1) < min_new_tokens
+        token = sample_logits(
+            logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            do_sample=do_sample,
+            suppress_mask=suppress_mask,
+            suppress_tokens=[eos_id] if suppress_eos else None,
+        )  # [bs]
+        past_hidden = hidden_states[:, -1:, :].clone()
+        gen_step += 1
+
+        # --- Yield chunk when buffer is full ---
+        if len(chunk_buffer) >= chunk_size:
+            torch.cuda.synchronize()
+            chunk_decode_time = time.time() - chunk_start
+            total_steps += len(chunk_buffer)
+
+            yield torch.stack(chunk_buffer, dim=1), torch.stack(valid_buffer, dim=1), {
+                'chunk_index': chunk_count,
+                'chunk_steps': len(chunk_buffer),
+                'prefill_ms': t_prefill * 1000 if chunk_count == 0 else 0,
+                'decode_ms': chunk_decode_time * 1000,
+                'total_steps_so_far': total_steps,
+                'is_final': False,
+            }
+
+            chunk_buffer = []
+            valid_buffer = []
+            chunk_count += 1
+            chunk_start = time.time()
+
+    # --- Yield final partial chunk ---
+    if chunk_buffer:
+        torch.cuda.synchronize()
+        chunk_decode_time = time.time() - chunk_start
+        total_steps += len(chunk_buffer)
+
+        yield torch.stack(chunk_buffer, dim=1), torch.stack(valid_buffer, dim=1), {
+            'chunk_index': chunk_count,
+            'chunk_steps': len(chunk_buffer),
+            'prefill_ms': t_prefill * 1000 if chunk_count == 0 else 0,
+            'decode_ms': chunk_decode_time * 1000,
+            'total_steps_so_far': total_steps,
+            'is_final': True,
+        }
+
+
+@torch.inference_mode()
 def parity_generate_streaming(
     talker,
     talker_input_embeds: torch.Tensor,
