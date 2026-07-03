@@ -25,7 +25,8 @@ class TalkerGraph:
     """
 
     def __init__(self, talker_model, talker_config, device='cuda', dtype=torch.bfloat16,
-                 max_seq_len=512):
+                 max_seq_len=512, batch_size=1):
+        self.batch_size = batch_size
         self.device = device
         device_index = torch.device(device).index
         device_index = device_index if device_index is not None else torch.cuda.current_device()
@@ -42,15 +43,16 @@ class TalkerGraph:
         # Transformers StaticCache — handles index_copy_ and fixed-size KV internally
         self.static_cache = StaticCache(config=talker_config, max_cache_len=max_seq_len)
 
-        # Static I/O buffers for CUDA graph
-        self.input_buf = torch.zeros(1, 1, self.hidden_size, dtype=dtype, device=device)
-        self.output_buf = torch.zeros(1, 1, self.hidden_size, dtype=dtype, device=device)
+        # Static I/O buffers for CUDA graph (batch dim first)
+        self.input_buf = torch.zeros(batch_size, 1, self.hidden_size, dtype=dtype, device=device)
+        self.output_buf = torch.zeros(batch_size, 1, self.hidden_size, dtype=dtype, device=device)
 
-        # Cache position buffer — updated before each graph replay
+        # Cache position buffer — updated before each graph replay.
+        # Shared across the batch: left-padded prefill aligns all slots to one position.
         self.cache_position = torch.zeros(1, dtype=torch.long, device=device)
         # Rope deltas from prefill (shape [batch, 1]) and position ids buffer.
-        self.rope_deltas = torch.zeros(1, 1, dtype=torch.float32, device=device)
-        self.position_ids = torch.zeros(3, 1, 1, dtype=torch.float32, device=device)
+        self.rope_deltas = torch.zeros(batch_size, 1, dtype=torch.float32, device=device)
+        self.position_ids = torch.zeros(3, batch_size, 1, dtype=torch.float32, device=device)
 
         self.graph = None
         self.captured = False
@@ -63,13 +65,13 @@ class TalkerGraph:
         config = self.model.config
         num_kv_heads = getattr(config, 'num_key_value_heads', config.num_attention_heads)
         head_dim = getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads)
-        dummy_k = torch.zeros(1, num_kv_heads, 1, head_dim, dtype=self.dtype, device=self.device)
+        dummy_k = torch.zeros(self.batch_size, num_kv_heads, 1, head_dim, dtype=self.dtype, device=self.device)
         for layer in self.static_cache.layers:
             if not layer.is_initialized:
                 layer.lazy_initialization(dummy_k)
 
     def _build_attention_masks(self, attention_mask: torch.Tensor | None = None):
-        dummy = torch.zeros(1, 1, self.hidden_size, dtype=self.dtype, device=self.device)
+        dummy = torch.zeros(self.batch_size, 1, self.hidden_size, dtype=self.dtype, device=self.device)
         max_len = self.max_seq_len
         self.attn_mask_table = [None] * max_len
 
