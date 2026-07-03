@@ -303,7 +303,8 @@ def fast_generate_streaming_batch(
         # --- CUDA-Graphed Code Predictor ---
         last_id_hidden = talker_codec_embed(token.unsqueeze(1))  # [bs, 1, H]
         pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)
-        codebook_token_ids = predictor_graph.run(pred_input)  # [bs, 15]
+        # .view normalizes the bs=1 legacy 1-D return to [bs, 15]
+        codebook_token_ids = predictor_graph.run(pred_input).view(bs, -1)
 
         all_cb = torch.cat([token.unsqueeze(1), codebook_token_ids], dim=1)  # [bs, 16]
         chunk_buffer.append(all_cb.detach())
