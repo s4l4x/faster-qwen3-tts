@@ -2,6 +2,10 @@
 
 Real-time Qwen3-TTS inference using CUDA graph capture. No Flash Attention, no vLLM, no Triton. Just `torch.cuda.CUDAGraph`. Supports both streaming and non-streaming generation.
 
+> **This fork** adds a fixed-batch, low-VRAM decode path (`enable_batch` + micro-batching
+> server) for concurrent/streaming workloads. See [docs/BATCHING.md](docs/BATCHING.md).
+> Pin it with `pip install "git+https://github.com/s4l4x/faster-qwen3-tts@v0.3.0-batch"`.
+
 ## Install
 
 Requires: Python 3.10+, PyTorch 2.5.1+, NVIDIA GPU with CUDA.
